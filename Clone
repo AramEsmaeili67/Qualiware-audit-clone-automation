@@ -1,0 +1,2136 @@
+/*
+ * QualiWare Audit Clone Automation
+ * --------------------------------
+ * Purpose:
+ *   Adds a custom "Clone" button to QualiWare AuditProgram object pages.
+ *   When used, the script clones the current AuditProgram, creates cloned
+ *   QualityAudit objects for each linked HasAudit item, adjusts date fields
+ *   to the target year, clears historical/completion fields, rebuilds the
+ *   cloned AuditProgram's HasAudit links, and attempts to preserve selected
+ *   reverse-link relationships such as Risk and AcknowledgeList associations.
+ *
+ * Intended runtime:
+ *   QualiWare web front end / HTML Feature JavaScript context.
+ *   This script depends on QualiWare client globals such as window.$$, QisCommon,
+ *   RepositoryObject, Clone(), SaveObject(), GetObjectSetByIds(), and UsingObjects().
+ *
+ * Important assumptions:
+ *   - The script is executed on an AuditProgram object page.
+ *   - The new AuditProgram name ends with a four-digit year, for example 2047.
+ *   - Linked QualityAudit objects are found through the source AuditProgram's HasAudit attribute.
+ *   - Risk reverse links and AcknowledgeList.ToBeAcknowledged links are discoverable through UsingObjects().
+ *   - Source and target links can be matched primarily by ObjId, with Name/Template as fallback.
+ *
+ * Maintenance note:
+ *   This is intentionally written as a self-contained browser script, rather than as modules,
+ *   because it is designed to be pasted directly into a QualiWare HTML Feature.
+ */
+(function () {
+    "use strict";
+ 
+    // DOM id for the custom button injected into the QualiWare page header.
+    var BUTTON_ID = "cr-clone-auditprogram-button";
+
+    // Global state key used to prevent duplicate clone runs in a single browser session.
+    var STATE_KEY = "__crAuditProgramCloneState";
+ 
+    // Create a shared state object on window so reloads/re-executions of the script can
+    // still detect whether a clone is already running.
+    if (!window[STATE_KEY]) {
+        window[STATE_KEY] = {};
+    }
+ 
+    // The clone operation is single-threaded by design. This flag prevents accidental
+    // double-clicks or duplicate button handlers from creating duplicate objects.
+    window[STATE_KEY].isRunning = false;
+ 
+        /**
+ 
+         * Return the currently loaded QualiWare repository object from the page context.
+ 
+         * QualiWare exposes the active object through window.$$, with data under window.$$.Data.
+ 
+         */
+ 
+    function currentObject() {
+        return window.$$ && window.$$.Data ? window.$$ : null;
+    }
+ 
+        /**
+ 
+         * Normalize either a RepositoryObject or a raw data object into the object's Data payload.
+ 
+         * Several QualiWare APIs return slightly different shapes, so this helper keeps the rest
+ 
+         * of the script from needing to care about those differences.
+ 
+         */
+ 
+    function dataOf(objectValue) {
+        return objectValue ? objectValue.Data || objectValue : null;
+    }
+ 
+        /**
+ 
+         * Confirm that the current browser page is an AuditProgram object page.
+ 
+         * The URL must contain an oid and the current object template must be AuditProgram.
+ 
+         */
+ 
+    function isAuditProgramPage() {
+        var objectValue = currentObject();
+        var objectId = new URLSearchParams(window.location.search).get("oid");
+ 
+        return !!(
+            objectValue &&
+            objectValue.Data &&
+            objectValue.Data.Template === "AuditProgram" &&
+            objectId
+        );
+    }
+ 
+        /**
+ 
+         * Remove any existing clone button.
+ 
+         * This prevents duplicate buttons when the QualiWare page refreshes partial content or
+ 
+         * when the script is reloaded in the same browser session.
+ 
+         */
+ 
+    function removeButton() {
+        var existingButton = document.getElementById(BUTTON_ID);
+ 
+        if (existingButton) {
+            existingButton.remove();
+        }
+    }
+ 
+        /**
+ 
+         * Locate a practical container in the QualiWare page header/ribbon where the custom
+ 
+         * Clone button can be inserted. The selectors are intentionally broad to handle
+ 
+         * minor layout differences across QualiWare pages.
+ 
+         */
+ 
+    function ribbonContainer() {
+        var selectors = [
+            "#contentHeader",
+            "#contentHeader td:last-child",
+            "#contentRight",
+            ".object-header",
+            ".object-toolbar",
+            ".toolbar",
+            ".ribbon",
+            "header"
+        ];
+ 
+        for (var i = 0; i < selectors.length; i++) {
+            var element = document.querySelector(selectors[i]);
+ 
+            if (element) {
+                return element;
+            }
+        }
+ 
+        return null;
+    }
+ 
+        /**
+ 
+         * Extract the target clone year from the end of the requested AuditProgram name.
+ 
+         * The clone workflow depends on this year to update dates on the cloned AP and QAs.
+ 
+         */
+ 
+    function yearFromName(nameValue) {
+        var match = String(nameValue || "")
+            .trim()
+            .match(/(20\d{2})$/);
+ 
+        return match ? match[1] : "";
+    }
+ 
+        /**
+ 
+         * Determine whether the new AuditProgram appears to be an External audit program.
+ 
+         * This controls whether cloned QualityAudit names should be prefixed with "External".
+ 
+         */
+ 
+    function startsWithExternal(nameValue) {
+        return /^external/i.test(
+            String(nameValue || "").trim()
+        );
+    }
+ 
+        /**
+ 
+         * Remove a trailing year suffix from a QualityAudit name so the new target-year name
+ 
+         * can be constructed cleanly. Handles both "Name - YYYY" and "Name YYYY" patterns.
+ 
+         */
+ 
+    function baseAuditName(nameValue) {
+        return String(nameValue || "")
+            .replace(/\s*-\s*20\d{2}\s*$/, "")
+            .replace(/\s+20\d{2}\s*$/, "")
+            .trim();
+    }
+ 
+        /**
+ 
+         * Build the cloned QualityAudit name using the source QA base name and target year.
+ 
+         * If the target AuditProgram is External, ensure the QA name is also prefixed External.
+ 
+         */
+ 
+    function newQualityAuditName(
+        sourceName,
+        targetYear,
+        isExternalProgram
+    ) {
+        var baseName = baseAuditName(sourceName);
+ 
+        if (!baseName) {
+            return "";
+        }
+ 
+        if (
+            isExternalProgram &&
+            !startsWithExternal(baseName)
+        ) {
+            baseName = "External " + baseName;
+        }
+ 
+        return baseName + " - " + targetYear;
+    }
+ 
+        /**
+ 
+         * Find an attribute name on a QualiWare object case-insensitively.
+ 
+         * This protects the script from small casing differences in attribute names.
+ 
+         */
+ 
+    function attributeName(data, requestedName) {
+        if (!data || !requestedName) {
+            return null;
+        }
+ 
+        if (
+            Object.prototype.hasOwnProperty.call(
+                data,
+                requestedName
+            )
+        ) {
+            return requestedName;
+        }
+ 
+        var requestedNameLower =
+            requestedName.toLowerCase();
+ 
+        var keys = Object.keys(data);
+ 
+        for (var i = 0; i < keys.length; i++) {
+            if (
+                keys[i].toLowerCase() ===
+                requestedNameLower
+            ) {
+                return keys[i];
+            }
+        }
+ 
+        return null;
+    }
+ 
+        /**
+ 
+         * Return the Value array from a QualiWare MultiLink-style attribute.
+ 
+         * Some APIs return the array directly, while others wrap it in { Format, Value }.
+ 
+         */
+ 
+    function multiLinks(attributeValue) {
+        if (!attributeValue) {
+            return [];
+        }
+ 
+        if (Array.isArray(attributeValue)) {
+            return attributeValue;
+        }
+ 
+        if (
+            attributeValue.Value &&
+            Array.isArray(attributeValue.Value)
+        ) {
+            return attributeValue.Value;
+        }
+ 
+        return [];
+    }
+ 
+        /**
+ 
+         * Identify QualiWare attributes that behave like MultiLink fields.
+ 
+         * The script uses this when scanning reverse-linked objects for links to the source object.
+ 
+         */
+ 
+    function isLinkAttribute(attributeValue) {
+        return !!(
+            attributeValue &&
+            typeof attributeValue === "object" &&
+            Array.isArray(attributeValue.Value)
+        );
+    }
+ 
+        /**
+ 
+         * Deep clone simple JSON-like values.
+ 
+         * This avoids reusing source-object references when creating target link/attribute values.
+ 
+         */
+ 
+    function clonePlainObject(value) {
+        if (
+            value === null ||
+            value === undefined ||
+            typeof value !== "object"
+        ) {
+            return value;
+        }
+ 
+        if (Array.isArray(value)) {
+            return value.map(clonePlainObject);
+        }
+ 
+        var copy = {};
+ 
+        Object.keys(value).forEach(function (key) {
+            copy[key] = clonePlainObject(value[key]);
+        });
+ 
+        return copy;
+    }
+ 
+        /**
+ 
+         * Clone a single QualiWare link value.
+ 
+         * Link values usually contain ObjId, RevisionId, Name, Template, Repository, and Configuration.
+ 
+         */
+ 
+    function cloneLink(linkValue) {
+        return clonePlainObject(linkValue);
+    }
+ 
+        /**
+ 
+         * Clone a MultiLink attribute while preserving the QualiWare wrapper structure.
+ 
+         * Used for copying allowed relationship fields such as TargetRegulation and TargetProcess.
+ 
+         */
+ 
+    function cloneMultiLink(attributeValue) {
+        if (!attributeValue) {
+            return {
+                Format: "MultiLink",
+                Value: []
+            };
+        }
+ 
+        if (Array.isArray(attributeValue)) {
+            return {
+                Format: "MultiLink",
+                Value: attributeValue.map(cloneLink)
+            };
+        }
+ 
+        if (
+            typeof attributeValue === "object" &&
+            Array.isArray(attributeValue.Value)
+        ) {
+            var copiedAttribute = {};
+ 
+            Object.keys(attributeValue).forEach(function (key) {
+                copiedAttribute[key] =
+                    clonePlainObject(attributeValue[key]);
+            });
+ 
+            copiedAttribute.Format =
+                attributeValue.Format || "MultiLink";
+ 
+            copiedAttribute.Value =
+                attributeValue.Value.map(cloneLink);
+ 
+            return copiedAttribute;
+        }
+ 
+        return clonePlainObject(attributeValue);
+    }
+ 
+        /**
+ 
+         * Create an empty MultiLink attribute while preserving the existing attribute's Format value.
+ 
+         * Used to reset HasAudit before the script inserts the newly cloned QualityAudits.
+ 
+         */
+ 
+    function emptyMultiLink(existingAttributeValue) {
+        return {
+            Format:
+                existingAttributeValue &&
+                existingAttributeValue.Format
+                    ? existingAttributeValue.Format
+                    : "MultiLink",
+            Value: []
+        };
+    }
+ 
+        /**
+ 
+         * Clear a named MultiLink field on an object.
+ 
+         * Used for fields that must not be carried over from the source to the clone, such as HasAuditee.
+ 
+         */
+ 
+    function clearMultiLink(data, name) {
+        if (!data || !name) {
+            return;
+        }
+ 
+        if (data[name] && typeof data[name] === "object") {
+            data[name].Format =
+                data[name].Format || "MultiLink";
+            data[name].Value = [];
+        } else {
+            data[name] = {
+                Format: "MultiLink",
+                Value: []
+            };
+        }
+    }
+ 
+        /**
+ 
+         * Build a stable identity key for a link or object data value.
+ 
+         * ObjId is preferred because names can change; Name and Template are used as fallback.
+ 
+         */
+ 
+    function linkKey(linkValue) {
+        if (!linkValue) {
+            return "";
+        }
+ 
+        if (linkValue.ObjId) {
+            return String(linkValue.ObjId);
+        }
+ 
+        return [
+            linkValue.Template || "",
+            linkValue.Name || ""
+        ].join("|");
+    }
+ 
+        /**
+ 
+         * Compare two QualiWare link values to determine whether they refer to the same repository object.
+ 
+         * ObjId comparison is primary, with Name/Template comparison as a fallback.
+ 
+         */
+ 
+    function sameLink(firstLink, secondLink) {
+        if (!firstLink || !secondLink) {
+            return false;
+        }
+ 
+        if (
+            firstLink.ObjId &&
+            secondLink.ObjId &&
+            firstLink.ObjId === secondLink.ObjId
+        ) {
+            return true;
+        }
+ 
+        return !!(
+            firstLink.Name &&
+            secondLink.Name &&
+            firstLink.Template &&
+            secondLink.Template &&
+            firstLink.Name === secondLink.Name &&
+            firstLink.Template === secondLink.Template
+        );
+    }
+ 
+        /**
+ 
+         * De-duplicate RepositoryObjects returned by QualiWare relationship APIs.
+ 
+         * The script calls multiple relationship methods, so duplicates are expected.
+ 
+         */
+ 
+    function uniqueObjects(objects) {
+        var seen = {};
+        var result = [];
+ 
+        objects.forEach(function (objectValue) {
+            var data = dataOf(objectValue);
+            var key = data ? linkKey(data) : "";
+ 
+            if (!key || seen[key]) {
+                return;
+            }
+ 
+            seen[key] = true;
+            result.push(objectValue);
+        });
+ 
+        return result;
+    }
+ 
+        /**
+ 
+         * Process asynchronous work one item at a time.
+ 
+         * Sequential execution is safer for repository updates because it avoids concurrent saves
+ 
+         * to the same Risk or AcknowledgeList object.
+ 
+         */
+ 
+    function sequential(items, worker) {
+        var results = [];
+ 
+        return items
+            .reduce(function (chain, item, index) {
+                return chain.then(function () {
+                    return Promise
+                        .resolve(worker(item, index))
+                        .then(function (result) {
+                            results.push(result);
+                            return results;
+                        });
+                });
+            }, Promise.resolve())
+            .then(function () {
+                return results;
+            });
+    }
+ 
+        /**
+ 
+         * Convert QualiWare object data into a standard link value that can be inserted into
+ 
+         * MultiLink attributes such as HasAudit, Risk reverse links, or ToBeAcknowledged.
+ 
+         */
+ 
+    function linkFromData(
+        data,
+        fallbackRepository,
+        fallbackConfiguration
+    ) {
+        data = data || {};
+ 
+        return {
+            Configuration:
+                data.Configuration ||
+                data.ConfId ||
+                fallbackConfiguration ||
+                "",
+            LinkValues: [],
+            ObjId: data.ObjId || "",
+            RevisionId: data.RevisionId || "",
+            Repository:
+                data.Repository ||
+                data.RepId ||
+                fallbackRepository ||
+                "",
+            Name: data.Name || "",
+            Template: data.Template || ""
+        };
+    }
+ 
+        /**
+ 
+         * Convert a RepositoryObject into a QualiWare link value using its Data payload.
+ 
+         */
+ 
+    function linkFromObject(
+        objectValue,
+        fallbackRepository,
+        fallbackConfiguration
+    ) {
+        return linkFromData(
+            dataOf(objectValue) || {},
+            fallbackRepository,
+            fallbackConfiguration
+        );
+    }
+ 
+        /**
+ 
+         * Left-pad date components so original date formatting is preserved where possible.
+ 
+         */
+ 
+    function pad(value, width) {
+        var text = String(value);
+ 
+        while (text.length < width) {
+            text = "0" + text;
+        }
+ 
+        return text;
+    }
+ 
+        /**
+ 
+         * Return the last valid day for a given month/year.
+ 
+         * Used to prevent invalid dates when moving February 29 to a non-leap year.
+ 
+         */
+ 
+    function lastDayOfMonth(year, month) {
+        return new Date(year, month, 0).getDate();
+    }
+ 
+        /**
+ 
+         * Return a copy of a Date with the year changed while preserving month/day/time.
+ 
+         * If the original day does not exist in the target year, it is capped to the month end.
+ 
+         */
+ 
+    function dateObjectWithYear(originalDate, targetYear) {
+        if (
+            !(originalDate instanceof Date) ||
+            isNaN(originalDate.getTime())
+        ) {
+            return originalDate;
+        }
+ 
+        var yearNumber = parseInt(targetYear, 10);
+        var month = originalDate.getMonth();
+ 
+        var day = Math.min(
+            originalDate.getDate(),
+            lastDayOfMonth(yearNumber, month + 1)
+        );
+ 
+        var newDate = new Date(originalDate.getTime());
+ 
+        newDate.setFullYear(yearNumber, month, day);
+ 
+        return newDate;
+    }
+ 
+        /**
+ 
+         * Adjust a QualiWare date value to the target year while preserving its original format.
+ 
+         * Handles Date objects, wrapped { Value } attributes, Microsoft /Date(...)/ strings,
+ 
+         * YYYY-MM-DD style strings, MM/DD/YYYY style strings, and parseable ISO strings.
+ 
+         */
+ 
+    function dateValueWithYear(value, targetYear) {
+        if (
+            value === undefined ||
+            value === null ||
+            value === ""
+        ) {
+            return value;
+        }
+ 
+        if (value instanceof Date) {
+            return dateObjectWithYear(value, targetYear);
+        }
+ 
+        if (
+            typeof value === "object" &&
+            value.hasOwnProperty("Value")
+        ) {
+            var copied = {};
+ 
+            Object.keys(value).forEach(function (key) {
+                copied[key] = clonePlainObject(value[key]);
+            });
+ 
+            copied.Value =
+                dateValueWithYear(value.Value, targetYear);
+ 
+            return copied;
+        }
+ 
+        if (typeof value === "string") {
+            var microsoftDate =
+                value.match(/^\/Date\((-?\d+)\)\/$/);
+ 
+            if (microsoftDate) {
+                var adjustedDate =
+                    dateObjectWithYear(
+                        new Date(
+                            parseInt(microsoftDate[1], 10)
+                        ),
+                        targetYear
+                    );
+ 
+                return (
+                    "/Date(" +
+                    adjustedDate.getTime() +
+                    ")/"
+                );
+            }
+ 
+            var ymd =
+                value.match(
+                    /^(\d{4})([-\/.])(\d{1,2})\2(\d{1,2})(.*)$/
+                );
+ 
+            if (ymd) {
+                var separator = ymd[2];
+                var monthText = ymd[3];
+                var dayText = ymd[4];
+ 
+                var month = parseInt(monthText, 10);
+ 
+                var day = Math.min(
+                    parseInt(dayText, 10),
+                    lastDayOfMonth(
+                        parseInt(targetYear, 10),
+                        month
+                    )
+                );
+ 
+                return (
+                    targetYear +
+                    separator +
+                    pad(month, monthText.length) +
+                    separator +
+                    pad(day, dayText.length) +
+                    ymd[5]
+                );
+            }
+ 
+            var mdy =
+                value.match(
+                    /^(\d{1,2})([-\/.])(\d{1,2})\2(\d{4})(.*)$/
+                );
+ 
+            if (mdy) {
+                var monthText2 = mdy[1];
+                var dayText2 = mdy[3];
+ 
+                var month2 = parseInt(monthText2, 10);
+ 
+                var day2 = Math.min(
+                    parseInt(dayText2, 10),
+                    lastDayOfMonth(
+                        parseInt(targetYear, 10),
+                        month2
+                    )
+                );
+ 
+                return (
+                    pad(month2, monthText2.length) +
+                    mdy[2] +
+                    pad(day2, dayText2.length) +
+                    mdy[2] +
+                    targetYear +
+                    mdy[5]
+                );
+            }
+ 
+            var parsedDate = new Date(value);
+ 
+            if (!isNaN(parsedDate.getTime())) {
+                return dateObjectWithYear(
+                    parsedDate,
+                    targetYear
+                ).toISOString();
+            }
+        }
+ 
+        return value;
+    }
+ 
+        /**
+ 
+         * Check whether an attribute is a QualiWare wrapper object with a Value property.
+ 
+         */
+ 
+    function isWrappedValue(attributeValue) {
+        return !!(
+            attributeValue &&
+            typeof attributeValue === "object" &&
+            attributeValue.hasOwnProperty("Value")
+        );
+    }
+ 
+        /**
+ 
+         * Extract the raw value from a QualiWare wrapped attribute when needed.
+ 
+         */
+ 
+    function rawValue(attributeValue) {
+        return isWrappedValue(attributeValue)
+            ? attributeValue.Value
+            : attributeValue;
+    }
+ 
+        /**
+ 
+         * Copy selected source date fields to the target object and update their year.
+ 
+         * Wrapper structure and Format metadata are retained where present.
+ 
+         */
+ 
+    function setDateFields(
+        sourceData,
+        targetObject,
+        targetYear,
+        fieldNames
+    ) {
+        if (
+            !sourceData ||
+            !targetObject ||
+            !targetObject.Data
+        ) {
+            return;
+        }
+ 
+        fieldNames.forEach(function (fieldName) {
+            var sourceAttribute = sourceData[fieldName];
+            var sourceValue = rawValue(sourceAttribute);
+ 
+            if (
+                sourceValue === undefined ||
+                sourceValue === null ||
+                sourceValue === ""
+            ) {
+                return;
+            }
+ 
+            var convertedValue =
+                dateValueWithYear(sourceValue, targetYear);
+ 
+            var targetAttribute =
+                targetObject.Data[fieldName];
+ 
+            if (isWrappedValue(sourceAttribute)) {
+                if (!isWrappedValue(targetAttribute)) {
+                    targetAttribute = {};
+ 
+                    Object.keys(sourceAttribute).forEach(
+                        function (key) {
+                            targetAttribute[key] =
+                                clonePlainObject(sourceAttribute[key]);
+                        }
+                    );
+                }
+ 
+                targetAttribute.Format =
+                    sourceAttribute.Format ||
+                    targetAttribute.Format ||
+                    "DateTime";
+ 
+                targetAttribute.Value =
+                    convertedValue;
+ 
+                targetObject.Data[fieldName] =
+                    targetAttribute;
+            } else {
+                targetObject.Data[fieldName] =
+                    convertedValue;
+            }
+        });
+    }
+ 
+        /**
+ 
+         * Apply target-year date conversion to AuditProgram-level date fields.
+ 
+         */
+ 
+    function setAuditProgramDates(
+        sourceData,
+        targetObject,
+        targetYear
+    ) {
+        setDateFields(
+            sourceData,
+            targetObject,
+            targetYear,
+            [
+                "StartDate",
+                "ApprovalDate",
+		"RiskConsiderationDate"
+            ]
+        );
+    }
+ 
+        /**
+ 
+         * Apply target-year date conversion to QualityAudit-level date fields.
+ 
+         */
+ 
+    function setQualityAuditDates(
+        sourceData,
+        targetObject,
+        targetYear
+    ) {
+        setDateFields(
+            sourceData,
+            targetObject,
+            targetYear,
+            [
+                "RiskConsiderationDate",
+                "VerificationDate",
+                "AuditDate"
+            ]
+        );
+    }
+ 
+        /**
+ 
+         * Clear a list of attributes from a cloned object.
+ 
+         * MultiLinks are reset to empty arrays; wrapped scalar values keep their wrapper but receive
+ 
+         * an empty Value; regular scalar attributes are set to an empty string.
+ 
+         */
+ 
+    function clearAttributes(objectValue, names) {
+        if (!objectValue || !objectValue.Data) {
+            return;
+        }
+ 
+        names.forEach(function (name) {
+            var currentValue = objectValue.Data[name];
+ 
+            if (
+                currentValue &&
+                typeof currentValue === "object" &&
+                Array.isArray(currentValue.Value)
+            ) {
+                objectValue.Data[name] = {
+                    Format:
+                        currentValue.Format ||
+                        "MultiLink",
+                    Value: []
+                };
+            } else if (
+                currentValue &&
+                typeof currentValue === "object" &&
+                currentValue.hasOwnProperty("Value")
+            ) {
+                var copied = {};
+ 
+                Object.keys(currentValue).forEach(function (key) {
+                    copied[key] =
+                        clonePlainObject(currentValue[key]);
+                });
+ 
+                copied.Value = "";
+ 
+                objectValue.Data[name] = copied;
+            } else {
+                objectValue.Data[name] = "";
+            }
+        });
+    }
+ 
+        /**
+ 
+         * Clear AuditProgram fields that should not be carried forward into the new audit cycle.
+ 
+         * These are mainly historical, status, revision, classification, circulation, cost, and result fields.
+ 
+         */
+ 
+    function clearAuditProgramFields(objectValue) {
+        clearAttributes(objectValue, [
+            "EndDate",
+            "RevisionValidFrom",
+            "RevisionValidTo",
+            "AlternateID",
+            "RevisionLabel",
+            "ConfidentialityClassification",
+            "PrivacyClassification",
+            "MagnitudeOfChange",
+            "DescriptionOfChange",
+            "PctCompleted",
+            "StandardTimeOfWorkPerformed",
+            "ActualTimeOfWorkPerformed",
+            "BudgetedCostOfWorkScheduled",
+            "BudgetedCostOfWorkPerformed",
+            "ActualCostOfWorkPerformed",
+            "TimeUnit",
+            "CostUnitForWork",
+            "ResultDate",
+            "ProjectStatusMilestoneDate",
+            "QualityControlDate",
+            "PrefChapter0",
+            "PrefChapter1",
+            "PrefChapter2",
+            "PrefChapter3",
+            "PrefChapter4",
+            "PhysicalReference",
+            "LatestMilestone",
+            "LatestQualityControl",
+            "LatestResult",
+            "CirculationPeriod",
+            "CirculationText",
+            "CirculateTo"
+        ]);
+    }
+ 
+        /**
+ 
+         * Clear QualityAudit fields that should not be copied to the new audit cycle.
+ 
+         * The source relationship context is preserved separately, but outcomes, status, revisions,
+ 
+         * nonconformance/change request links, and operational tracking fields are reset.
+ 
+         */
+ 
+    function clearQualityAuditFields(objectValue) {
+        if (!objectValue || !objectValue.Data) {
+            return;
+        }
+ 
+        objectValue.Data.NonConformance = {
+            Format: "MultiLink",
+            Value: []
+        };
+ 
+        objectValue.Data.ChangeRequest = {
+            Format: "MultiLink",
+            Value: []
+        };
+ 
+        objectValue.Data.Conclusion = "";
+        ///objectValue.Data.LeadAuditorApproval = null;
+        ///objectValue.Data.ProcessOwnerApproval = null;
+ 
+        objectValue.Data.CirculateTo = {
+            Format: "MultiLink",
+            Value: []
+        };
+ 
+        clearAttributes(objectValue, [
+            "AlternateID",
+            "RevisionLabel",
+            "RevisionValidFrom",
+            "RevisionValidTo",
+            "ConfidentialityClassification",
+            "MagnitudeOfChange",
+            "DescriptionOfChange",
+            "PrivacyClassification",
+            "CirculationPeriod",
+            "CirculationText",
+            "PctCompleted",
+            "StandardTimeOfWorkPerformed",
+            "ActualTimeOfWorkPerformed",
+            "BudgetedCostOfWorkScheduled",
+            "BudgetedCostOfWorkPerformed",
+            "ActualCostOfWorkPerformed",
+            "ProjectStatusMilestoneDate",
+            "LatestMilestone",
+            "LatestQualityControl",
+            "LatestResult",
+            "ResultDate",
+            "QualityControlDate",
+            "PrefChapter0",
+            "PrefChapter1",
+            "PrefChapter2",
+            "PrefChapter3",
+            "PrefChapter4",
+            "PhysicalReference",
+            "TimeUnit",
+            "CostUnitForWork",
+            "DueDate"
+        ]);
+    }
+ 
+        /**
+ 
+         * Normalize the many possible object-set response shapes returned by QualiWare APIs.
+ 
+         * The script supports arrays, Value/Objects/Items wrappers, and single object responses.
+ 
+         */
+ 
+    function objectsFromSet(result) {
+        if (!result) {
+            return [];
+        }
+ 
+        if (Array.isArray(result)) {
+            return result;
+        }
+ 
+        if (
+            result.Value &&
+            Array.isArray(result.Value)
+        ) {
+            return result.Value;
+        }
+ 
+        if (
+            result.Objects &&
+            Array.isArray(result.Objects)
+        ) {
+            return result.Objects;
+        }
+ 
+        if (
+            result.objects &&
+            Array.isArray(result.objects)
+        ) {
+            return result.objects;
+        }
+ 
+        if (
+            result.Items &&
+            Array.isArray(result.Items)
+        ) {
+            return result.Items;
+        }
+ 
+        if (
+            result.items &&
+            Array.isArray(result.items)
+        ) {
+            return result.items;
+        }
+ 
+        if (result.Data || result.attributes) {
+            return [result];
+        }
+ 
+        return [];
+    }
+ 
+        /**
+ 
+         * Return the first object from a QualiWare object-set response.
+ 
+         * Used when loading a single linked object by ID.
+ 
+         */
+ 
+    function firstObjectFromSet(result) {
+        var objects = objectsFromSet(result);
+ 
+        return objects[0] || null;
+    }
+ 
+        /**
+ 
+         * Convert a raw object payload into a RepositoryObject when necessary.
+ 
+         * Some QualiWare methods return raw data, while SaveObject/Clone require RepositoryObject behavior.
+ 
+         */
+ 
+    function toRepositoryObject(rawObject) {
+        if (!rawObject) {
+            return null;
+        }
+ 
+        if (
+            typeof rawObject.Clone === "function" &&
+            rawObject.Data
+        ) {
+            return rawObject;
+        }
+ 
+        if (typeof RepositoryObject === "undefined") {
+            return null;
+        }
+ 
+        var repositoryObject = new RepositoryObject();
+ 
+        if (
+            typeof repositoryObject.merge !==
+            "function"
+        ) {
+            return null;
+        }
+ 
+        repositoryObject.merge(rawObject);
+ 
+        return repositoryObject;
+    }
+ 
+        /**
+ 
+         * Normalize an object-set response and convert every item into a RepositoryObject.
+ 
+         */
+ 
+    function repositoryObjectsFromSet(result) {
+        var repositoryObjects = [];
+ 
+        objectsFromSet(result).forEach(function (rawObject) {
+            var repositoryObject =
+                toRepositoryObject(rawObject);
+ 
+            if (repositoryObject && repositoryObject.Data) {
+                repositoryObjects.push(repositoryObject);
+            }
+        });
+ 
+        return repositoryObjects;
+    }
+ 
+        /**
+ 
+         * Build a QisCommon OID from a QualiWare link value.
+ 
+         * Revision-specific links are respected when RevisionId is present.
+ 
+         */
+ 
+    function oidFromLink(linkValue) {
+        if (!linkValue || !linkValue.ObjId) {
+            return null;
+        }
+ 
+        if (linkValue.RevisionId) {
+            return QisCommon.Oid.createFrom(
+                linkValue.ObjId +
+                "/" +
+                linkValue.RevisionId
+            );
+        }
+ 
+        return QisCommon.Oid
+            .createFrom(linkValue.ObjId)
+            .toDefault();
+    }
+ 
+        /**
+ 
+         * Load a full QualiWare object from a link value using GetObjectSetByIds.
+ 
+         * This is needed before cloning QualityAudits or updating reverse-linked objects.
+ 
+         */
+ 
+    function loadObjectFromLink(linkValue) {
+        if (!linkValue) {
+            return Promise.reject(
+                "Linked object is empty."
+            );
+        }
+ 
+        if (
+            typeof linkValue.Clone === "function" &&
+            linkValue.Data
+        ) {
+            return Promise.resolve(linkValue);
+        }
+ 
+        var objectValue = currentObject();
+ 
+        if (
+            !objectValue ||
+            typeof objectValue.GetObjectSetByIds !==
+                "function"
+        ) {
+            return Promise.reject(
+                "GetObjectSetByIds is not available."
+            );
+        }
+ 
+        var oid = oidFromLink(linkValue);
+ 
+        if (!oid) {
+            return Promise.reject(
+                "Could not build OID for linked object: " +
+                (linkValue.Name || "")
+            );
+        }
+ 
+        return objectValue
+            .GetObjectSetByIds(
+                [oid],
+                QisCommon.ObjectInstantiationLevel.FullData
+            )
+            .then(function (result) {
+                var rawObject =
+                    firstObjectFromSet(result);
+ 
+                var repositoryObject =
+                    toRepositoryObject(rawObject);
+ 
+                if (
+                    !repositoryObject ||
+                    !repositoryObject.Data
+                ) {
+                    throw new Error(
+                        "Could not load linked object: " +
+                        (linkValue.Name || "")
+                    );
+                }
+ 
+                return repositoryObject;
+            });
+    }
+ 
+        /**
+ 
+         * Safely call an optional QualiWare object method and normalize failures to null.
+ 
+         * This lets the script try several relationship APIs without failing the full clone.
+ 
+         */
+ 
+    function callObjectMethod(
+        objectValue,
+        methodName,
+        args
+    ) {
+        if (
+            !objectValue ||
+            typeof objectValue[methodName] !== "function"
+        ) {
+            return Promise.resolve(null);
+        }
+ 
+        try {
+            return Promise.resolve(
+                objectValue[methodName].apply(
+                    objectValue,
+                    args || []
+                )
+            );
+        } catch (error) {
+            return Promise.resolve(null);
+        }
+    }
+ 
+        /**
+ 
+         * Find objects that use/reference a source object.
+ 
+         * Used to discover Risk and AcknowledgeList objects that already point at the source AP/QA.
+ 
+         */
+ 
+    function usingObjects(objectValue) {
+        if (!objectValue || !objectValue.Data) {
+            return Promise.resolve([]);
+        }
+ 
+        var calls = [
+            function () {
+                return callObjectMethod(
+                    objectValue,
+                    "UsingObjects",
+                    []
+                );
+            },
+            function () {
+                return callObjectMethod(
+                    objectValue,
+                    "UsingObjects",
+                    [
+                        QisCommon.ObjectInstantiationLevel.FullData
+                    ]
+                );
+            },
+            function () {
+                return callObjectMethod(
+                    objectValue,
+                    "RelatedObjects",
+                    []
+                );
+            },
+            function () {
+                return callObjectMethod(
+                    objectValue,
+                    "GetRelatedObjects",
+                    []
+                );
+            }
+        ];
+ 
+        return sequential(calls, function (call) {
+            return call();
+        }).then(function (results) {
+            var objects = [];
+ 
+            results.forEach(function (result) {
+                objects =
+                    objects.concat(
+                        repositoryObjectsFromSet(result)
+                    );
+            });
+ 
+            return uniqueObjects(objects);
+        });
+    }
+ 
+        /**
+ 
+         * Determine whether a returned reverse-linked object is a Risk.
+ 
+         */
+ 
+    function isRiskObject(objectValue) {
+        var data = dataOf(objectValue);
+ 
+        return !!(data && data.Template === "Risk");
+    }
+ 
+        /**
+ 
+         * Determine whether a returned reverse-linked object is an AcknowledgeList.
+ 
+         */
+ 
+    function isAcknowledgeListObject(objectValue) {
+        var data = dataOf(objectValue);
+ 
+        return !!(
+            data &&
+            data.Template === "AcknowledgeList"
+        );
+    }
+ 
+    /**
+ 
+     * Search all MultiLink attributes on an object and return the attribute that contains
+ 
+     * a link to the source AP/QA. Used for generic reverse-link preservation.
+ 
+     */
+ 
+function linkAttributeContainingSource(
+        objectData,
+        sourceLink
+    ) {
+        var matchedName = null;
+ 
+        if (!objectData || !sourceLink) {
+            return null;
+        }
+ 
+        Object.keys(objectData).some(function (name) {
+            var attributeValue = objectData[name];
+ 
+            if (!isLinkAttribute(attributeValue)) {
+                return false;
+            }
+ 
+            var containsSource =
+                multiLinks(attributeValue).some(
+                    function (existingLink) {
+                        return sameLink(
+                            existingLink,
+                            sourceLink
+                        );
+                    }
+                );
+ 
+            if (containsSource) {
+                matchedName = name;
+                return true;
+            }
+ 
+            return false;
+        });
+ 
+        return matchedName;
+    }
+ 
+        /**
+ 
+         * Add the cloned AP/QA to the same MultiLink attribute that already references the source AP/QA.
+ 
+         * This preserves relationships such as Risk concerns without needing to know the exact attribute name.
+ 
+         */
+ 
+    function addTargetToSameReverseLink(
+        reverseObject,
+        sourceLink,
+        targetLink
+    ) {
+        if (
+            !reverseObject ||
+            !reverseObject.Data ||
+            !sourceLink ||
+            !targetLink
+        ) {
+            return false;
+        }
+ 
+        var name =
+            linkAttributeContainingSource(
+                reverseObject.Data,
+                sourceLink
+            );
+ 
+        if (
+            !name ||
+            !isLinkAttribute(reverseObject.Data[name])
+        ) {
+            return false;
+        }
+ 
+        var attributeValue = reverseObject.Data[name];
+ 
+        var alreadyLinked =
+            attributeValue.Value.some(function (existingLink) {
+                return sameLink(existingLink, targetLink);
+            });
+ 
+        if (alreadyLinked) {
+            return false;
+        }
+ 
+        attributeValue.Value.push(cloneLink(targetLink));
+        reverseObject.Data[name] = attributeValue;
+ 
+        return true;
+    }
+ 
+        /**
+ 
+         * Resolve the ToBeAcknowledged attribute on an AcknowledgeList object.
+ 
+         */
+ 
+    function toBeAcknowledgedAttributeName(objectData) {
+        return attributeName(objectData, "ToBeAcknowledged");
+    }
+ 
+        /**
+ 
+         * If an AcknowledgeList.ToBeAcknowledged attribute contains the source AP/QA, add the
+ 
+         * cloned AP/QA to that same ToBeAcknowledged list and avoid duplicate links.
+ 
+         */
+ 
+    function addTargetToAcknowledgeList(
+        acknowledgeListObject,
+        sourceLink,
+        targetLink
+    ) {
+        if (
+            !acknowledgeListObject ||
+            !acknowledgeListObject.Data ||
+            !sourceLink ||
+            !targetLink
+        ) {
+            return false;
+        }
+ 
+        if (
+            acknowledgeListObject.Data.Template !==
+            "AcknowledgeList"
+        ) {
+            return false;
+        }
+ 
+        var name =
+            toBeAcknowledgedAttributeName(
+                acknowledgeListObject.Data
+            );
+ 
+        if (!name) {
+            return false;
+        }
+ 
+        if (
+            !isLinkAttribute(
+                acknowledgeListObject.Data[name]
+            )
+        ) {
+            return false;
+        }
+ 
+        var toBeAcknowledgedAttribute =
+            acknowledgeListObject.Data[name];
+ 
+        var containsSource =
+            toBeAcknowledgedAttribute.Value.some(
+                function (existingLink) {
+                    return sameLink(
+                        existingLink,
+                        sourceLink
+                    );
+                }
+            );
+ 
+        if (!containsSource) {
+            return false;
+        }
+ 
+        var alreadyLinked =
+            toBeAcknowledgedAttribute.Value.some(
+                function (existingLink) {
+                    return sameLink(
+                        existingLink,
+                        targetLink
+                    );
+                }
+            );
+ 
+        if (alreadyLinked) {
+            return false;
+        }
+ 
+        toBeAcknowledgedAttribute.Value.push(
+            cloneLink(targetLink)
+        );
+ 
+        acknowledgeListObject.Data[name] =
+            toBeAcknowledgedAttribute;
+ 
+        return true;
+    }
+ 
+        /**
+ 
+         * After a clone is saved, preserve reverse-link relationships by finding objects that use
+ 
+         * the source AP/QA and adding the cloned AP/QA to relevant Risk and AcknowledgeList links.
+ 
+         */
+ 
+    function linkCloneToRiskAndAcknowledgeLists(
+        sourceObject,
+        savedTargetObject
+    ) {
+        if (
+            !sourceObject ||
+            !sourceObject.Data ||
+            !savedTargetObject ||
+            !savedTargetObject.Data
+        ) {
+            return Promise.resolve({
+                risk: 0,
+                acknowledgeList: 0
+            });
+        }
+ 
+        var counts = {
+            risk: 0,
+            acknowledgeList: 0
+        };
+ 
+        var sourceLink = linkFromObject(sourceObject);
+        var targetLink = linkFromObject(savedTargetObject);
+ 
+        return usingObjects(sourceObject)
+            .then(function (objects) {
+                return sequential(objects, function (reverseObject) {
+                    var changed = false;
+ 
+                    if (isRiskObject(reverseObject)) {
+                        changed = addTargetToSameReverseLink(
+                            reverseObject,
+                            sourceLink,
+                            targetLink
+                        );
+ 
+                        if (changed) {
+                            counts.risk++;
+                            return reverseObject.SaveObject();
+                        }
+                    }
+ 
+                    if (isAcknowledgeListObject(reverseObject)) {
+                        changed = addTargetToAcknowledgeList(
+                            reverseObject,
+                            sourceLink,
+                            targetLink
+                        );
+ 
+                        if (changed) {
+                            counts.acknowledgeList++;
+                            return reverseObject.SaveObject();
+                        }
+                    }
+ 
+return null;
+                });
+            })
+            .then(function () {
+                return counts;
+            });
+    }
+ 
+        /**
+ 
+         * Clone one source QualityAudit, apply target-year naming/date rules, clear historical fields,
+ 
+         * save it, then preserve Risk and AcknowledgeList reverse links that referenced the source QA.
+ 
+         */
+ 
+    function createQualityAudit(
+        sourceQualityAuditLink,
+        targetYear,
+        isExternalProgram
+    ) {
+        var sourceName =
+            sourceQualityAuditLink.Name || "";
+ 
+        var targetName =
+            newQualityAuditName(
+                sourceName,
+                targetYear,
+                isExternalProgram
+            );
+ 
+        if (!targetName) {
+            return Promise.resolve(null);
+        }
+ 
+        return loadObjectFromLink(
+            sourceQualityAuditLink
+        ).then(function (sourceQaObject) {
+            var sourceData = sourceQaObject.Data;
+ 
+            if (
+                !sourceData ||
+                sourceData.Template !== "QualityAudit"
+            ) {
+                throw new Error(
+                    "Loaded object is not a QualityAudit: " +
+                    sourceName
+                );
+            }
+ 
+            if (
+                typeof sourceQaObject.Clone !== "function"
+            ) {
+                throw new Error(
+                    "Clone function was not found on source QualityAudit: " +
+                    sourceName
+                );
+            }
+ 
+            var targetQaObject =
+                sourceQaObject.Clone(false);
+ 
+            targetQaObject.Data.Name = targetName;
+            targetQaObject.Data.Template = "QualityAudit";
+ 
+            targetQaObject.Data.TargetRegulation =
+                cloneMultiLink(sourceData.TargetRegulation);
+ 
+            targetQaObject.Data.TargetProcess =
+                cloneMultiLink(sourceData.TargetProcess);
+ 
+clearQualityAuditFields(targetQaObject);
+ 
+            clearMultiLink(
+                targetQaObject.Data,
+                "HasAuditee"
+            );
+ 
+            setQualityAuditDates(
+                sourceData,
+                targetQaObject,
+                targetYear
+            );
+ 
+            return targetQaObject
+                .SaveObject()
+                .then(function (savedQaObject) {
+                    return linkCloneToRiskAndAcknowledgeLists(
+                        sourceQaObject,
+                        savedQaObject
+                    ).then(function (counts) {
+                        return {
+                            savedObject: savedQaObject,
+                            riskCount: counts.risk || 0,
+                            acknowledgeListCount:
+                                counts.acknowledgeList || 0
+                        };
+                    });
+                });
+        });
+    }
+ 
+        /**
+ 
+         * Main clone workflow.
+ 
+         * 1. Validate target year and source HasAudit links.
+ 
+         * 2. Clone the AuditProgram shell and prepare its target-year fields.
+ 
+         * 3. Clone each linked QualityAudit sequentially.
+ 
+         * 4. Rebuild the cloned AuditProgram's HasAudit with the saved cloned QAs.
+ 
+         * 5. Save the cloned AuditProgram and preserve its Risk/AcknowledgeList reverse links.
+ 
+         */
+ 
+    function cloneAuditProgram(sourceAuditProgramObject, newName, button) {
+        var state = window[STATE_KEY];
+ 
+        if (state.isRunning) {
+            alert(
+                "A clone operation is already running. Please wait for it to finish."
+            );
+ 
+            return Promise.resolve(null);
+        }
+ 
+        state.isRunning = true;
+ 
+        var targetYear = yearFromName(newName);
+ 
+        if (!targetYear) {
+            state.isRunning = false;
+ 
+            alert(
+                "The cloned AuditProgram name must end with a valid year, for example: Internal Audits - 2047"
+            );
+ 
+            return Promise.resolve(null);
+        }
+ 
+        var isExternalProgram =
+            startsWithExternal(newName);
+ 
+        var sourceAuditLinks =
+            multiLinks(sourceAuditProgramObject.Data.HasAudit);
+ 
+        if (sourceAuditLinks.length === 0) {
+            state.isRunning = false;
+ 
+            alert(
+                "The source AuditProgram has no linked QualityAudits in HasAudit."
+            );
+ 
+            return Promise.resolve(null);
+        }
+ 
+        button.disabled = true;
+        button.innerText = "Cloning...";
+ 
+        var clonedAuditProgram =
+            sourceAuditProgramObject.Clone(false);
+ 
+        var totalRiskLinks = 0;
+        var totalAcknowledgeListLinks = 0;
+ 
+        clonedAuditProgram.Data.Name = newName;
+        clonedAuditProgram.Data.Template = "AuditProgram";
+ 
+        setAuditProgramDates(
+            sourceAuditProgramObject.Data,
+            clonedAuditProgram,
+            targetYear
+        );
+ 
+        clearAuditProgramFields(clonedAuditProgram);
+ 
+        clonedAuditProgram.Data.HasAudit =
+            emptyMultiLink(
+                sourceAuditProgramObject.Data.HasAudit
+            );
+ 
+        return sequential(
+            sourceAuditLinks,
+            function (sourceQualityAuditLink) {
+                return createQualityAudit(
+                    sourceQualityAuditLink,
+                    targetYear,
+                    isExternalProgram
+                );
+            }
+        )
+            .then(function (qualityAuditResults) {
+                var validResults =
+                    qualityAuditResults.filter(function (item) {
+                        return !!(
+                            item &&
+                            item.savedObject &&
+                            item.savedObject.Data
+                        );
+                    });
+ 
+                if (validResults.length === 0) {
+                    throw new Error(
+                        "No QualityAudit objects were created."
+                    );
+                }
+ 
+                validResults.forEach(function (item) {
+                    totalRiskLinks += item.riskCount || 0;
+                    totalAcknowledgeListLinks +=
+                        item.acknowledgeListCount || 0;
+                });
+ 
+                clonedAuditProgram.Data.HasAudit = {
+                    Format: "MultiLink",
+                    Value:
+                        validResults.map(function (item) {
+                            return linkFromObject(
+                                item.savedObject,
+                                sourceAuditProgramObject.Data.RepId,
+                                sourceAuditProgramObject.Data.ConfId
+                            );
+                        })
+                };
+ 
+                return clonedAuditProgram.SaveObject();
+            })
+            .then(function (savedAuditProgram) {
+                return linkCloneToRiskAndAcknowledgeLists(
+                    sourceAuditProgramObject,
+                    savedAuditProgram
+                ).then(function (counts) {
+                    totalRiskLinks += counts.risk || 0;
+                    totalAcknowledgeListLinks +=
+                        counts.acknowledgeList || 0;
+ 
+                    return savedAuditProgram;
+                });
+            })
+            .then(function (savedAuditProgram) {
+ 
+                alert("Clone is Complete");
+ 
+                state.isRunning = false;
+                button.disabled = false;
+                button.innerText = "Clone";
+ 
+                return savedAuditProgram;
+            })
+            .catch(function (error) {
+                alert(
+                    "Clone failed: " +
+                    (
+                        error && error.message
+                            ? error.message
+                            : error
+                    )
+                );
+ 
+                state.isRunning = false;
+                button.disabled = false;
+                button.innerText = "Clone";
+ 
+                return null;
+            });
+    }
+ 
+        /**
+ 
+         * Create and wire the custom Clone button in the QualiWare page header.
+ 
+         * The click handler validates the current object and requested target name before starting the clone.
+ 
+         */
+ 
+    function addButton() {
+        if (!isAuditProgramPage()) {
+            removeButton();
+            return;
+        }
+ 
+        removeButton();
+ 
+        var container = ribbonContainer();
+ 
+        if (!container) {
+            return;
+        }
+ 
+        if (
+            window.getComputedStyle(container).position ===
+            "static"
+        ) {
+            container.style.position = "relative";
+        }
+ 
+        var button = document.createElement("button");
+ 
+        button.id = BUTTON_ID;
+        button.type = "button";
+        button.innerText = "Clone";
+ 
+        button.style.position = "absolute";
+        button.style.top = "11px";
+        button.style.right = "12px";
+        button.style.zIndex = "999999";
+        button.style.height = "30px";
+        button.style.minWidth = "68px";
+        button.style.padding = "0 12px";
+        button.style.background = "#2b6f5f";
+        button.style.color = "white";
+        button.style.border = "none";
+        button.style.borderRadius = "2px";
+        button.style.cursor = "pointer";
+        button.style.fontSize = "12px";
+        button.style.fontWeight = "600";
+        button.style.lineHeight = "24px";
+        button.style.textAlign = "center";
+        button.style.boxShadow =
+            "0 1px 2px rgba(0, 0, 0, 0.18)";
+        button.style.opacity = "0.98";
+ 
+        button.onmouseenter = function () {
+            button.style.background = "#245f52";
+            button.style.border = "none";
+            button.style.opacity = "1";
+        };
+ 
+        button.onmouseleave = function () {
+            button.style.background = "#2b6f5f";
+            button.style.border = "none";
+            button.style.opacity = "0.98";
+        };
+ 
+        button.onclick = function (event) {
+            event.preventDefault();
+            event.stopPropagation();
+ 
+            if (window[STATE_KEY].isRunning) {
+                alert(
+                    "A clone operation is already running. Please wait for it to finish."
+                );
+ 
+                return false;
+            }
+ 
+            var sourceObject = currentObject();
+ 
+            if (!sourceObject || !sourceObject.Data) {
+                alert(
+                    "Could not find the current QualiWare object context."
+                );
+ 
+                return false;
+            }
+ 
+            if (
+                sourceObject.Data.Template !==
+                "AuditProgram"
+            ) {
+                alert(
+                    "Clone is only available for AuditProgram objects."
+                );
+ 
+                return false;
+            }
+ 
+            if (typeof sourceObject.Clone !== "function") {
+                alert(
+                    "Clone function was not found on this object."
+                );
+ 
+                return false;
+            }
+ 
+            var sourceName =
+                sourceObject.Data.Name ||
+                document.title ||
+                "Cloned AuditProgram";
+ 
+            var newName = prompt(
+                "Enter a name for the cloned AuditProgram. The name must end with a year, for example: Internal Audits - 2047",
+                sourceName
+            );
+ 
+            if (!newName || newName.trim() === "") {
+                alert("Clone cancelled. A name is required.");
+                return false;
+            }
+ 
+            newName = newName.trim();
+ 
+            if (!yearFromName(newName)) {
+                alert(
+                    "Clone cancelled. The name must end with a valid year, for example: Internal Audits - 2047"
+                );
+ 
+                return false;
+            }
+ 
+            cloneAuditProgram(sourceObject, newName, button);
+ 
+            return false;
+        };
+ 
+        container.appendChild(button);
+    }
+ 
+        /**
+ 
+         * Re-add the Clone button after QualiWare page rendering events if it is missing.
+ 
+         */
+ 
+    function refreshButton() {
+        if (!document.getElementById(BUTTON_ID)) {
+            addButton();
+        }
+    }
+ 
+    // Remove any existing button before initial render so this script can be safely
+    // pasted/reloaded during development without stacking duplicate buttons.
+    removeButton();
+ 
+    // Register the initial button once the DOM is available.
+    if (document.readyState === "loading") {
+        document.addEventListener(
+            "DOMContentLoaded",
+            refreshButton
+        );
+    } else {
+        refreshButton();
+    }
+ 
+    // QualiWare pages can finish rendering asynchronously. These delayed checks ensure
+    // the Clone button appears even if the header/ribbon is added after initial page load.
+    setTimeout(refreshButton, 1000);
+    setTimeout(refreshButton, 3000);
+})();
